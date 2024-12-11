@@ -1,39 +1,37 @@
 """
-Sample from a trained model
+Sample from a trained model, working directly with token IDs
 """
 import os
-import pickle
-from contextlib import nullcontext
 import torch
-import tiktoken
+from contextlib import nullcontext
 from model import GPTConfig, GPT
+import numpy as np
+import imageio
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
+init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant
 out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
+max_new_tokens = 129 # number of tokens generated in each sample
+temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random
+top_k = 200 # retain only the top_k most likely tokens
 seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
+device = 'cpu'  # Force everything to run on CPU
+dtype = 'float32'  # Use float32 for CPU operations
+compile = False # use PyTorch 2.0 to compile the model
 exec(open('configurator.py').read()) # overrides from command line or config file
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+device_type = 'cuda' if 'cuda' in device else 'cpu'
+device = 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
 if init_from == 'resume':
-    # init from a model saved in a specific directory
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     gptconf = GPTConfig(**checkpoint['model_args'])
@@ -44,46 +42,65 @@ if init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+    model = model.to(device)
 elif init_from.startswith('gpt2'):
-    # init from a given GPT-2 model
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
+    model = model.to(device)
 
 model.eval()
-model.to(device)
 if compile:
-    model = torch.compile(model) # requires PyTorch 2.0 (optional)
+    model = torch.compile(model)
 
-# look for the meta pickle in case it is available in the dataset folder
-load_meta = False
-if init_from == 'resume' and 'config' in checkpoint and 'dataset' in checkpoint['config']: # older checkpoints might not have these...
-    meta_path = os.path.join('data', checkpoint['config']['dataset'], 'meta.pkl')
-    load_meta = os.path.exists(meta_path)
-if load_meta:
-    print(f"Loading meta from {meta_path}...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    # TODO want to make this more general to arbitrary encoder/decoder schemes
-    stoi, itos = meta['stoi'], meta['itos']
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-else:
-    # ok let's assume gpt-2 encodings by default
-    print("No meta.pkl found, assuming GPT-2 encodings...")
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
-    decode = lambda l: enc.decode(l)
+# prepare the input
+data = np.memmap("./0.bin", dtype=np.int16, mode='r')
+bos_positions = np.where(data == 1024)[0]
+first_valid_position = bos_positions[0]
+context_length = 129 * 19  # First 19 images
+ground_truth_length = 129  # One more image for ground truth
+total_length = context_length + ground_truth_length
 
-# encode the beginning of the prompt
-if start.startswith('FILE:'):
-    with open(start[5:], 'r', encoding='utf-8') as f:
-        start = f.read()
-start_ids = encode(start)
-x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+# Get both context and ground truth data, ensuring they're on the correct device from the start
+x = torch.tensor(data[first_valid_position:first_valid_position+context_length].astype(np.int64), device=device)
+ground_truth = torch.tensor(data[first_valid_position+context_length:first_valid_position+total_length].astype(np.int64), device=device)
 
+# Apply the same transformation to both
+x = torch.where(x == 1025, torch.tensor(1024), x)
+ground_truth = torch.where(ground_truth == 1025, torch.tensor(1024), ground_truth)
+
+x = x.unsqueeze(0)  # Add batch dimension
+ground_truth = ground_truth.unsqueeze(0)  # Add batch dimension
+
+from decode import decode
+import cv2
+
+model = model.to('cuda' if torch.cuda.is_available() else 'cpu')
 # run generation
 with torch.no_grad():
     with ctx:
-        for k in range(num_samples):
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            print(decode(y[0].tolist()))
-            print('---------------')
+        frames = []  # List to store frames for GIF
+        current_context = x.to('cuda')  # Move initial context to GPU
+
+        for frame_idx in range(6):  # Generate 6 frames in total
+            print(frame_idx)
+            # Ensure the model and context are on the GPU
+            y = model.generate(current_context, max_new_tokens, temperature=temperature, top_k=top_k)
+            
+            # Move the generated tensor to CPU for decoding
+            y_generated = y[:, current_context.shape[1]:current_context.shape[1]+129].to('cpu')
+            
+            # Decode and store the generated frame
+            img = decode(y_generated, 'cpu')  # Ensure decode uses CPU
+            # img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            frames.append(img)
+            
+            # Update the context using a sliding window, move back to GPU
+            current_context = torch.cat((current_context[:, 129:], y_generated.to('cuda')), dim=1)
+
+        # Save frames as a GIF
+        gif_path = "output.gif"
+        imageio.mimsave(gif_path, frames, format='GIF', duration=0.5)  # Save as GIF with a duration of 0.5 seconds per frame
+
+        print("GIF saved as:", gif_path)
+
+
+

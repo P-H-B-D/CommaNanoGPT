@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from pytorch_optimizer import SOAP
 
 from model import GPTConfig, GPT
 
@@ -40,14 +41,15 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
+wandb_log = True # disabled by default
+wandb_project = 'nanoGPTimage'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+batch_size = 12
 block_size = 1024
+
 # model
 n_layer = 12
 n_head = 12
@@ -113,22 +115,61 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+
+# def get_batch(split):
+#     # We recreate np.memmap every batch to avoid a memory leak, as per
+#     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+#     if split == 'train':
+#         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+#     else:
+#         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+#     ix = torch.randint(len(data) - block_size, (batch_size,))
+#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#     if device_type == 'cuda':
+#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#     else:
+#         x, y = x.to(device), y.to(device)
+#     return x, y
+BOS_TOKEN = 1024
+FRAME_LENGTH = 129
+block_size = 129*20
+
+device = 'cuda'
+device_type = 'cuda'
+
+# Global variables for precomputed positions
+_valid_positions = None
+
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    global _valid_positions
+    data = np.memmap("./nanogpt/0.bin", dtype=np.int16, mode='r')
+    
+    # Compute positions once
+    if _valid_positions is None:
+        bos_positions = np.where(data == BOS_TOKEN)[0]
+        _valid_positions = bos_positions[bos_positions <= len(data) - block_size]
+        if len(_valid_positions) == 0:
+            raise RuntimeError("No valid BOS positions found with enough space for block_size")
+
+    # Randomly select starting positions from valid BOS positions
+    selected_positions = np.random.choice(_valid_positions, size=batch_size)
+    offsets = np.random.randint(0, FRAME_LENGTH, size=batch_size)
+    ix = torch.tensor(selected_positions + offsets)
+    
+    x = torch.stack([torch.tensor(data[i:i+block_size].astype(np.int64), device='cpu') for i in ix])
+    y = torch.stack([torch.tensor(data[i+1:i+1+block_size].astype(np.int64), device='cpu') for i in ix])
+    
+    x = torch.where(x == 1025, torch.tensor(1024), x)
+    y = torch.where(y == 1025, torch.tensor(1024), y)
+    
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        x, y = x.to(device), y.to(device)
     else:
         x, y = x.to(device), y.to(device)
-    return x, y
+    
+    return x.clone(), y.clone()
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -153,6 +194,7 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model_args['vocab_size'] = 1025
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -192,11 +234,18 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+# Replace the Adam optimizer with SOAP
+optimizer = SOAP(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# If you have specific parameters for SOAP, you can set them here
+# optimizer = SOAP(model.parameters(), lr=learning_rate, weight_decay=weight_decay, ...)
+
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -224,6 +273,8 @@ def estimate_loss():
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
+    print("X,Y: ",X,Y)
+    print("X.shape,Y.shape: ",X.shape,Y.shape)
     model.train()
     return out
 
@@ -252,6 +303,21 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+# After model is initialized and moved to device
+
+# if init_from == 'scratch' and master_process:
+#     # Save the random initialization
+#     checkpoint = {
+#         'model': raw_model.state_dict(),
+#         'optimizer': optimizer.state_dict(),
+#         'model_args': model_args,
+#         'iter_num': 0,
+#         'best_val_loss': 1e9,
+#         'config': config,
+#     }
+#     print(f"saving initial random weights to {out_dir}")
+#     torch.save(checkpoint, os.path.join(out_dir, 'random_init.pt'))
+
 while True:
 
     # determine and set the learning rate for this iteration
