@@ -8,7 +8,7 @@ def decode(input_tensor, device):
     with torch.device('cpu'):
         decoder = Decoder(config)
         decoder.load_state_dict_from_url('https://huggingface.co/commaai/commavq-gpt2m/resolve/main/decoder_pytorch_model.bin', assign=True)
-        decoder = decoder.eval().to(device='cuda')
+        decoder = decoder.eval().to(device='cpu')
     
     # Ignore the BOS token
     target = input_tensor[:, 1:].to(torch.int64).to(device='cpu')

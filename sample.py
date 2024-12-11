@@ -53,7 +53,7 @@ if compile:
     model = torch.compile(model)
 
 # prepare the input
-data = np.memmap("./0.bin", dtype=np.int16, mode='r')
+data = np.memmap("./nanogpt/0.bin", dtype=np.int16, mode='r')
 bos_positions = np.where(data == 1024)[0]
 first_valid_position = bos_positions[0]
 context_length = 129 * 19  # First 19 images
