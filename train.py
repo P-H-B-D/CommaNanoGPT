@@ -140,26 +140,31 @@ device = 'cuda'
 device_type = 'cuda'
 
 # Global variables for precomputed positions
-_valid_positions = None
+_valid_positions = {}
 
 def get_batch(split):
     global _valid_positions
-    data = np.memmap("./nanogpt/0.bin", dtype=np.int16, mode='r')
-    
-    # Compute positions once
-    if _valid_positions is None:
-        bos_positions = np.where(data == BOS_TOKEN)[0]
-        _valid_positions = bos_positions[bos_positions <= len(data) - block_size]
-        if len(_valid_positions) == 0:
-            raise RuntimeError("No valid BOS positions found with enough space for block_size")
+    data_files = [f"./nanogpt/{i}.bin" for i in range(6)]  # List of all data files
 
-    # Randomly select starting positions from valid BOS positions
-    selected_positions = np.random.choice(_valid_positions, size=batch_size)
+    # Compute positions once for each file
+    if not _valid_positions:
+        for file_index, file_path in enumerate(data_files):
+            data = np.memmap(file_path, dtype=np.int16, mode='r')
+            bos_positions = np.where(data == BOS_TOKEN)[0]
+            valid_positions = bos_positions[bos_positions <= len(data) - block_size]
+            if len(valid_positions) == 0:
+                raise RuntimeError(f"No valid BOS positions found in {file_path} with enough space for block_size")
+            _valid_positions[file_index] = valid_positions
+
+    # Randomly select a file and starting positions from valid BOS positions
+    selected_file_index = np.random.choice(list(_valid_positions.keys()), size=batch_size)
+    selected_positions = [np.random.choice(_valid_positions[file_idx]) for file_idx in selected_file_index]
     offsets = np.random.randint(0, FRAME_LENGTH, size=batch_size)
-    ix = torch.tensor(selected_positions + offsets)
+    ix = torch.tensor([pos + offset for pos, offset in zip(selected_positions, offsets)])
     
-    x = torch.stack([torch.tensor(data[i:i+block_size].astype(np.int64), device='cpu') for i in ix])
-    y = torch.stack([torch.tensor(data[i+1:i+1+block_size].astype(np.int64), device='cpu') for i in ix])
+    # Load data from the selected files
+    x = torch.stack([torch.tensor(np.memmap(data_files[file_idx], dtype=np.int16, mode='r')[i:i+block_size].astype(np.int64), device='cpu') for file_idx, i in zip(selected_file_index, ix)])
+    y = torch.stack([torch.tensor(np.memmap(data_files[file_idx], dtype=np.int16, mode='r')[i+1:i+1+block_size].astype(np.int64), device='cpu') for file_idx, i in zip(selected_file_index, ix)])
     
     x = torch.where(x == 1025, torch.tensor(1024), x)
     y = torch.where(y == 1025, torch.tensor(1024), y)

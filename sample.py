@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from model import GPTConfig, GPT
 import numpy as np
 import imageio
+from decode import decode
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant
@@ -69,9 +70,6 @@ ground_truth = torch.where(ground_truth == 1025, torch.tensor(1024), ground_trut
 
 x = x.unsqueeze(0)  # Add batch dimension
 ground_truth = ground_truth.unsqueeze(0)  # Add batch dimension
-
-from decode import decode
-import cv2
 
 model = model.to('cuda' if torch.cuda.is_available() else 'cpu')
 # run generation
