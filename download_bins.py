@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 
 # Define the repository and file type to download
-REPO_ID = "P-H-B-D-a16z/CommaVQmini"
+REPO_ID = "P-H-B-D-a16z/CommaVQbins"
 FILE_EXTENSION = ".bin"
 DOWNLOAD_DIR = "./nanogpt/"  # Specify download directory
 
@@ -20,7 +20,7 @@ def download_file(file_name):
         print(f"Failed to download {file_name}: {e}")
 
 # List the specific files you want to download
-bin_files = [f"{x}.bin" for x in range(6)]
+bin_files = [f"{x}.bin" for x in range(41)]
 
 # Download files in parallel
 with ThreadPoolExecutor() as executor:

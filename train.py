@@ -27,6 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from pytorch_optimizer import SOAP
+from torch.utils.data import Dataset, DataLoader
 
 from model import GPTConfig, GPT
 
@@ -105,6 +106,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -115,66 +117,64 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+# Custom Dataset class
+class GPTDataset(Dataset):
+    def __init__(self, data_files, block_size, bos_token, frame_length):
+        self.data_files = data_files
+        self.block_size = block_size
+        self.bos_token = bos_token
+        self.frame_length = frame_length
 
-# def get_batch(split):
-#     # We recreate np.memmap every batch to avoid a memory leak, as per
-#     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-#     if split == 'train':
-#         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-#     else:
-#         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-#     ix = torch.randint(len(data) - block_size, (batch_size,))
-#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-#     if device_type == 'cuda':
-#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-#     else:
-#         x, y = x.to(device), y.to(device)
-#     return x, y
+        # Open all memmaps once
+        self.data_arrays = [np.memmap(f, dtype=np.int16, mode='r') for f in data_files]
+        self._valid_positions = self._compute_valid_positions()
+
+    def _compute_valid_positions(self):
+        valid_positions = {}
+        for file_index, data in enumerate(self.data_arrays):
+            bos_positions = np.where(data == self.bos_token)[0]
+            valid_positions[file_index] = bos_positions[bos_positions <= len(data) - self.block_size]
+            if len(valid_positions[file_index]) == 0:
+                raise RuntimeError(f"No valid BOS positions for file index {file_index}")
+        return valid_positions
+
+    def __len__(self):
+        return len(self.data_files) * len(next(iter(self._valid_positions.values())))
+
+    def __getitem__(self, idx):
+        file_idx = idx // len(self._valid_positions[0])
+        pos_idx = idx % len(self._valid_positions[file_idx])
+        selected_position = self._valid_positions[file_idx][pos_idx]
+        offset = np.random.randint(0, self.frame_length)
+        ix = selected_position + offset
+
+        data = self.data_arrays[file_idx]  # Use cached memmap
+        x = torch.tensor(data[ix:ix+self.block_size].astype(np.int64))
+        y = torch.tensor(data[ix+1:ix+1+self.block_size].astype(np.int64))
+
+        # Replace out-of-range token if necessary
+        x = torch.where(x == 1025, 1024, x)
+        y = torch.where(y == 1025, 1024, y)
+
+        return x, y
+# Initialize the dataset and dataloader
+print("Initializing the dataset and dataloader")
+data_files = [f"./nanogpt/{i}.bin" for i in range(40)]
 BOS_TOKEN = 1024
 FRAME_LENGTH = 129
-block_size = 129*20
+dataset = GPTDataset(data_files, block_size, BOS_TOKEN, FRAME_LENGTH)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=12, pin_memory=True,prefetch_factor=2,persistent_workers=True)
 
-device = 'cuda'
-device_type = 'cuda'
-
-# Global variables for precomputed positions
-_valid_positions = {}
-
-def get_batch(split):
-    global _valid_positions
-    data_files = [f"./nanogpt/{i}.bin" for i in range(6)]  # List of all data files
-
-    # Compute positions once for each file
-    if not _valid_positions:
-        for file_index, file_path in enumerate(data_files):
-            data = np.memmap(file_path, dtype=np.int16, mode='r')
-            bos_positions = np.where(data == BOS_TOKEN)[0]
-            valid_positions = bos_positions[bos_positions <= len(data) - block_size]
-            if len(valid_positions) == 0:
-                raise RuntimeError(f"No valid BOS positions found in {file_path} with enough space for block_size")
-            _valid_positions[file_index] = valid_positions
-
-    # Randomly select a file and starting positions from valid BOS positions
-    selected_file_index = np.random.choice(list(_valid_positions.keys()), size=batch_size)
-    selected_positions = [np.random.choice(_valid_positions[file_idx]) for file_idx in selected_file_index]
-    offsets = np.random.randint(0, FRAME_LENGTH, size=batch_size)
-    ix = torch.tensor([pos + offset for pos, offset in zip(selected_positions, offsets)])
-    
-    # Load data from the selected files
-    x = torch.stack([torch.tensor(np.memmap(data_files[file_idx], dtype=np.int16, mode='r')[i:i+block_size].astype(np.int64), device='cpu') for file_idx, i in zip(selected_file_index, ix)])
-    y = torch.stack([torch.tensor(np.memmap(data_files[file_idx], dtype=np.int16, mode='r')[i+1:i+1+block_size].astype(np.int64), device='cpu') for file_idx, i in zip(selected_file_index, ix)])
-    
-    x = torch.where(x == 1025, torch.tensor(1024), x)
-    y = torch.where(y == 1025, torch.tensor(1024), y)
-    
-    if device_type == 'cuda':
-        x, y = x.to(device), y.to(device)
-    else:
-        x, y = x.to(device), y.to(device)
-    
-    return x.clone(), y.clone()
+# Create initial iterator outside the main loop
+train_iter = iter(dataloader)
+# Get first batch of data
+try:
+    X, Y = next(train_iter)
+    X, Y = X.to(device), Y.to(device)
+except StopIteration:
+    train_iter = iter(dataloader)
+    X, Y = next(train_iter)
+    X, Y = X.to(device), Y.to(device)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -270,16 +270,20 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    print("X,Y: ",X,Y)
-    print("X.shape,Y.shape: ",X.shape,Y.shape)
+    losses = torch.zeros(eval_iters)
+    eval_iter = iter(dataloader)  # We'll use the same dataloader for now
+    for k in range(eval_iters):
+        try:
+            X, Y = next(eval_iter)
+        except StopIteration:
+            eval_iter = iter(dataloader)
+            X, Y = next(eval_iter)
+        X, Y = X.to(device), Y.to(device)
+        with ctx:
+            logits, loss = model(X, Y)
+        losses[k] = loss.item()
+    out['train'] = losses.mean()  # For now, using same loss for train and val
+    out['val'] = losses.mean()    # You might want to create separate train/val dataloaders
     model.train()
     return out
 
@@ -302,8 +306,6 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-# training loop
-X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -337,7 +339,15 @@ while True:
         with ctx:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps
-        X, Y = get_batch('train')
+        
+        # Get next batch, handling StopIteration
+        try:
+            X, Y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(dataloader)
+            X, Y = next(train_iter)
+            
+        X, Y = X.to(device), Y.to(device)
         scaler.scale(loss).backward()
 
     # clip the gradient
@@ -367,6 +377,24 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
+    # Evaluate and save model at specified intervals
+    if iter_num % eval_interval == 0 and master_process:
+        val_loss = estimate_loss()['val']
+        print(f"iter {iter_num}: validation loss {val_loss:.4f}")
+        if val_loss < best_val_loss or always_save_checkpoint:
+            best_val_loss = val_loss
+            checkpoint = {
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'model_args': model_args,
+                'iter_num': iter_num,
+                'best_val_loss': best_val_loss,
+                'config': config,
+            }
+            print(f"saving checkpoint to {out_dir}")
+            torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
     iter_num += 1
     local_iter_num += 1
 
